@@ -1,0 +1,260 @@
+name: Build & Push Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker 标签'
+        required: false
+        default: 'latest'
+        type: string
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Prepare platform name
+        run: |
+          echo "PLATFORM_NAME=${{ matrix.platform }}" | sed 's|/|-|g' >> $GITHUB_ENV
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: version_check
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # Check if this is the first commit or if previous commit exists
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            git checkout HEAD~1 -- package.json 2>/dev/null || echo "{\"version\":\"0.0.0\"}" > package.json.old
+            PREVIOUS_VERSION=$(node -p "try { require('./package.json').version } catch(e) { '0.0.0' }")
+            git checkout HEAD -- package.json
+          else
+            PREVIOUS_VERSION="0.0.0"
+          fi
+
+          echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "Version changed: $PREVIOUS_VERSION -> $CURRENT_VERSION"
+          else
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged: $CURRENT_VERSION"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase repository owner
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version_check.outputs.current_version }},enable=${{ steps.version_check.outputs.version_changed == 'true' }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv,name-canonical=true,push=true
+          no-cache: true
+          pull: true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_NAME }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check version
+        id: version_check
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            git checkout HEAD~1 -- package.json 2>/dev/null || echo "{\"version\":\"0.0.0\"}" > package.json.old
+            PREVIOUS_VERSION=$(node -p "try { require('./package.json').version } catch(e) { '0.0.0' }")
+            git checkout HEAD -- package.json
+          else
+            PREVIOUS_VERSION="0.0.0"
+          fi
+
+          echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "Version changed: $PREVIOUS_VERSION -> $CURRENT_VERSION"
+          else
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged: $CURRENT_VERSION"
+          fi
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase repository owner
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          # Always create latest tag
+          docker buildx imagetools create -t ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv:latest \
+            $(printf 'ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv@sha256:%s ' *)
+
+          # Create version tag if version changed
+          if [ "${{ steps.version_check.outputs.version_changed }}" = "true" ]; then
+            docker buildx imagetools create -t ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv:${{ steps.version_check.outputs.current_version }} \
+              $(printf 'ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv@sha256:%s ' *)
+          fi
+
+          # Create custom tag if provided
+          if [ -n "${{ github.event.inputs.tag }}" ] && [ "${{ github.event.inputs.tag }}" != "latest" ]; then
+            docker buildx imagetools create -t ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv:${{ github.event.inputs.tag }} \
+              $(printf 'ghcr.io/${{ steps.lowercase.outputs.owner }}/lunatv@sha256:%s ' *)
+          fi
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs:
+      - merge
+    if: always() && github.event_name != 'pull_request'
+    steps:
+      - name: Set lowercase repository owner
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Delete old untagged images
+        run: |
+          PACKAGE_NAME="lunatv"
+          ORG_OR_USER="${{ steps.lowercase.outputs.owner }}"
+          KEEP_COUNT=10  # 保留最新的 10 个未标记版本
+          
+          echo "Fetching all versions for ${ORG_OR_USER}/${PACKAGE_NAME}..."
+
+          ALL_UNTAGGED=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/users/${ORG_OR_USER}/packages/container/${PACKAGE_NAME}/versions?per_page=100" \
+            --paginate \
+            --jq '[.[] | select(.metadata.container.tags | length == 0) | .id] | .[]')
+
+          VERSIONS_ARRAY=($ALL_UNTAGGED)
+          TOTAL_COUNT=${#VERSIONS_ARRAY[@]}
+          
+          echo "Found $TOTAL_COUNT untagged versions"
+          echo "Keeping the latest $KEEP_COUNT versions"
+          
+          if [ $TOTAL_COUNT -gt $KEEP_COUNT ]; then
+            DELETE_COUNT=$((TOTAL_COUNT - KEEP_COUNT))
+            echo "Will delete $DELETE_COUNT old untagged versions"
+
+            DELETED=0
+            for ((i=KEEP_COUNT; i<TOTAL_COUNT; i++)); do
+              VERSION_ID=${VERSIONS_ARRAY[$i]}
+              echo "Deleting untagged version ID: $VERSION_ID"
+              if gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/users/${ORG_OR_USER}/packages/container/${PACKAGE_NAME}/versions/${VERSION_ID}"; then
+                DELETED=$((DELETED+1))
+                echo "✓ Deleted successfully"
+              else
+                echo "✗ Failed to delete"
+              fi
+            done
+            
+            echo "Successfully deleted $DELETED untagged versions"
+          else
+            echo "No cleanup needed. Total untagged versions ($TOTAL_COUNT) is within the keep limit ($KEEP_COUNT)"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 2
